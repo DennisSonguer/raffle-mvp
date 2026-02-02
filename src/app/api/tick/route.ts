@@ -4,11 +4,24 @@ import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
 export const runtime = "nodejs";
 
-export async function GET(req: Request) {
+function isAuthorized(req: Request) {
   const url = new URL(req.url);
-  const secret = url.searchParams.get("secret") ?? "";
 
-  if (process.env.CRON_SECRET && secret !== process.env.CRON_SECRET) {
+  // 1) Vercel Cron: Authorization: Bearer <CRON_SECRET>
+  const auth = req.headers.get("authorization") ?? "";
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+
+  // 2) Manuell (Browser): /api/tick?secret=...
+  const qp = url.searchParams.get("secret") ?? "";
+
+  const secret = process.env.CRON_SECRET ?? "";
+  if (!secret) return true;
+
+  return bearer === secret || qp === secret;
+}
+
+export async function GET(req: Request) {
+  if (!isAuthorized(req)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
@@ -35,7 +48,11 @@ export async function GET(req: Request) {
 
     if (e2) continue;
 
-    const total = (purchases ?? []).reduce((a: number, x: any) => a + Number((x as any).qty ?? 0), 0);
+    const total = (purchases ?? []).reduce(
+      (a: number, x: any) => a + Number((x as any).qty ?? 0),
+      0
+    );
+
     const winningTicket = total > 0 ? randomInt(1, total + 1) : null;
 
     const { error: e3 } = await supabaseAdmin
