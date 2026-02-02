@@ -1,4 +1,4 @@
-import { supabase } from "./supabase";
+import { supabase } from "@/lib/supabase";
 
 export type Raffle = {
   id: string;
@@ -14,33 +14,33 @@ export type Raffle = {
 export type Round = {
   id: number;
   raffleId: string;
-  endsAt: string;
+  endsAt: string; // ISO
   status: "RUNNING" | "ENDED";
   winningTicket: number | null;
   totalAtDraw: number | null;
 };
 
-function mapRaffle(r: any): Raffle {
+function mapRaffle(row: any): Raffle {
   return {
-    id: String(r.id),
-    title: r.title ?? "",
-    prize: r.prize ?? "",
-    ticketPrice: Number(r.ticket_price ?? 0),
-    durationMs: Number(r.duration_ms ?? 0),
-    demoTotalTickets: Number(r.demo_total_tickets ?? 0),
-    image: r.image ?? "",
-    description: r.description ?? "",
+    id: String(row.id),
+    title: String(row.title ?? ""),
+    prize: String(row.prize ?? ""),
+    ticketPrice: Number(row.ticket_price ?? 0),
+    durationMs: Number(row.duration_ms ?? 0),
+    demoTotalTickets: Number(row.demo_total_tickets ?? 0),
+    image: String(row.image ?? ""),
+    description: String(row.description ?? ""),
   };
 }
 
-function mapRound(r: any): Round {
+function mapRound(row: any): Round {
   return {
-    id: Number(r.id),
-    raffleId: String(r.raffle_id),
-    endsAt: String(r.ends_at),
-    status: (r.status ?? "RUNNING") as any,
-    winningTicket: r.winning_ticket ?? null,
-    totalAtDraw: r.total_at_draw ?? null,
+    id: Number(row.id),
+    raffleId: String(row.raffle_id),
+    endsAt: String(row.ends_at),
+    status: (row.status as any) === "ENDED" ? "ENDED" : "RUNNING",
+    winningTicket: row.winning_ticket === null || row.winning_ticket === undefined ? null : Number(row.winning_ticket),
+    totalAtDraw: row.total_at_draw === null || row.total_at_draw === undefined ? null : Number(row.total_at_draw),
   };
 }
 
@@ -66,7 +66,7 @@ export async function getRaffle(id: string): Promise<Raffle | null> {
 }
 
 export async function upsertRaffle(r: Raffle) {
-  const { error } = await supabase.from("raffles").upsert({
+  const payload = {
     id: r.id,
     title: r.title,
     prize: r.prize,
@@ -75,7 +75,9 @@ export async function upsertRaffle(r: Raffle) {
     demo_total_tickets: r.demoTotalTickets,
     image: r.image,
     description: r.description,
-  });
+  };
+
+  const { error } = await supabase.from("raffles").upsert(payload);
   if (error) throw error;
 }
 
@@ -84,11 +86,53 @@ export async function deleteRaffle(id: string) {
   if (error) throw error;
 }
 
+/**
+ * Sorgt dafür, dass es pro raffle_id genau 1 RUNNING Runde gibt (oder erstellt eine).
+ */
+export async function ensureRunningRound(raffle: Raffle): Promise<Round> {
+  const { data: existing, error: e1 } = await supabase
+    .from("raffle_rounds")
+    .select("*")
+    .eq("raffle_id", raffle.id)
+    .eq("status", "RUNNING")
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  if (e1) throw e1;
+
+  if (existing && existing.length > 0) return mapRound(existing[0]);
+
+  const endsAt = new Date(Date.now() + raffle.durationMs).toISOString();
+
+  const { data: created, error: e2 } = await supabase
+    .from("raffle_rounds")
+    .insert({ raffle_id: raffle.id, ends_at: endsAt, status: "RUNNING" })
+    .select("*")
+    .single();
+
+  if (!e2 && created) return mapRound(created);
+
+  // Falls unique-index blockt (weil parallel schon eine RUNNING erstellt wurde)
+  const { data: ex2, error: e3 } = await supabase
+    .from("raffle_rounds")
+    .select("*")
+    .eq("raffle_id", raffle.id)
+    .eq("status", "RUNNING")
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  if (e3) throw (e2 ?? e3);
+  if (ex2 && ex2.length > 0) return mapRound(ex2[0]);
+
+  throw (e2 ?? new Error("ensureRunningRound failed"));
+}
+
 export async function getRunningRounds(raffleIds: string[]): Promise<Record<string, Round>> {
-  if (!raffleIds.length) return {};
+  if (raffleIds.length === 0) return {};
+
   const { data, error } = await supabase
     .from("raffle_rounds")
-    .select("id,raffle_id,ends_at,status,winning_ticket,total_at_draw,created_at")
+    .select("*")
     .in("raffle_id", raffleIds)
     .eq("status", "RUNNING")
     .order("created_at", { ascending: false });
@@ -97,89 +141,23 @@ export async function getRunningRounds(raffleIds: string[]): Promise<Record<stri
 
   const map: Record<string, Round> = {};
   for (const row of data ?? []) {
-    const rr = mapRound(row);
-    if (!map[rr.raffleId]) map[rr.raffleId] = rr; // first = newest
+    const rid = String((row as any).raffle_id);
+    if (!map[rid]) map[rid] = mapRound(row);
   }
   return map;
 }
 
-export async function getLatestEndedRound(raffleId: string): Promise<Round | null> {
-  const { data, error } = await supabase
-    .from("raffle_rounds")
-    .select("id,raffle_id,ends_at,status,winning_ticket,total_at_draw,created_at")
-    .eq("raffle_id", raffleId)
-    .eq("status", "ENDED")
-    .order("created_at", { ascending: false })
-    .limit(1);
-
-  if (error) throw error;
-  return data && data[0] ? mapRound(data[0]) : null;
-}
-
-export async function ensureRunningRound(raffle: Raffle): Promise<Round> {
-  const rrMap = await getRunningRounds([raffle.id]);
-  const existing = rrMap[raffle.id];
-  if (existing) return existing;
-
+export async function startNewRound(raffle: Raffle): Promise<Round> {
   const endsAt = new Date(Date.now() + raffle.durationMs).toISOString();
+
   const { data, error } = await supabase
     .from("raffle_rounds")
     .insert({ raffle_id: raffle.id, ends_at: endsAt, status: "RUNNING" })
-    .select("id,raffle_id,ends_at,status,winning_ticket,total_at_draw")
+    .select("*")
     .single();
 
   if (error) throw error;
   return mapRound(data);
-}
-
-export async function buyTicket(opts: {
-  raffleId: string;
-  roundId: number;
-  username: string;
-  creatorCode?: string | null;
-  qty?: number;
-}) {
-  const { raffleId, roundId, username, creatorCode, qty = 1 } = opts;
-  const { error } = await supabase.from("ticket_purchases").insert({
-    raffle_id: raffleId,
-    round_id: roundId,
-    username,
-    qty,
-    creator_code: creatorCode || null,
-  });
-  if (error) throw error;
-}
-
-export async function getPurchases(roundId: number): Promise<{ id: number; username: string; qty: number }[]> {
-  const { data, error } = await supabase
-    .from("ticket_purchases")
-    .select("id,username,qty")
-    .eq("round_id", roundId)
-    .order("id", { ascending: true });
-
-  if (error) throw error;
-  return (data ?? []).map((x: any) => ({
-    id: Number(x.id),
-    username: String(x.username),
-    qty: Number(x.qty ?? 0),
-  }));
-}
-
-export async function getMyTickets(roundId: number, username: string): Promise<number> {
-  const { data, error } = await supabase
-    .from("ticket_purchases")
-    .select("qty")
-    .eq("round_id", roundId)
-    .eq("username", username);
-
-  if (error) throw error;
-  return (data ?? []).reduce((a: number, r: any) => a + Number(r.qty ?? 0), 0);
-}
-
-export async function getTotalTickets(roundId: number): Promise<number> {
-  const { data, error } = await supabase.from("ticket_purchases").select("qty").eq("round_id", roundId);
-  if (error) throw error;
-  return (data ?? []).reduce((a: number, r: any) => a + Number(r.qty ?? 0), 0);
 }
 
 export async function endRound(roundId: number, winningTicket: number | null, totalAtDraw: number | null) {
@@ -195,33 +173,111 @@ export async function endRound(roundId: number, winningTicket: number | null, to
   if (error) throw error;
 }
 
-export async function startNewRound(raffle: Raffle): Promise<Round> {
-  const endsAt = new Date(Date.now() + raffle.durationMs).toISOString();
-  const { data, error } = await supabase
-    .from("raffle_rounds")
-    .insert({ raffle_id: raffle.id, ends_at: endsAt, status: "RUNNING" })
-    .select("id,raffle_id,ends_at,status,winning_ticket,total_at_draw")
-    .single();
-
+export async function buyTicket(args: {
+  raffleId: string;
+  roundId: number;
+  username: string;
+  qty: number;
+  creatorCode: string | null;
+}) {
+  const { error } = await supabase.from("ticket_purchases").insert({
+    raffle_id: args.raffleId,
+    round_id: args.roundId,
+    username: args.username,
+    qty: args.qty,
+    creator_code: args.creatorCode,
+  });
   if (error) throw error;
-  return mapRound(data);
 }
 
-export async function getUserTicketsByRaffle(username: string, roundIds: number[]) {
-  if (!username || !roundIds.length) return {} as Record<string, number>;
+export async function getPurchases(roundId: number): Promise<{ username: string; qty: number }[]> {
   const { data, error } = await supabase
     .from("ticket_purchases")
-    .select("raffle_id,qty")
+    .select("username, qty")
+    .eq("round_id", roundId)
+    .order("created_at", { ascending: true });
+
+  if (error) throw error;
+  return (data ?? []).map((x: any) => ({ username: String(x.username), qty: Number(x.qty ?? 0) }));
+}
+
+export async function getTotalTickets(roundId: number): Promise<number> {
+  const { data, error } = await supabase
+    .from("ticket_purchases")
+    .select("qty")
+    .eq("round_id", roundId);
+
+  if (error) throw error;
+  return (data ?? []).reduce((a: number, x: any) => a + Number(x.qty ?? 0), 0);
+}
+
+export async function getMyTickets(roundId: number, username: string): Promise<number> {
+  if (!username) return 0;
+
+  const { data, error } = await supabase
+    .from("ticket_purchases")
+    .select("qty")
+    .eq("round_id", roundId)
+    .eq("username", username);
+
+  if (error) throw error;
+  return (data ?? []).reduce((a: number, x: any) => a + Number(x.qty ?? 0), 0);
+}
+
+/**
+ * Liefert Map: raffleId -> tickets vom User (für laufende Runden)
+ */
+export async function getUserTicketsByRaffle(username: string, roundIds: number[]): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
+  if (!username || roundIds.length === 0) return out;
+
+  const { data, error } = await supabase
+    .from("ticket_purchases")
+    .select("raffle_id, qty")
     .eq("username", username)
     .in("round_id", roundIds);
 
   if (error) throw error;
 
-  const out: Record<string, number> = {};
   for (const row of data ?? []) {
     const rid = String((row as any).raffle_id);
-    const q = Number((row as any).qty ?? 0);
-    out[rid] = (out[rid] ?? 0) + q;
+    const qty = Number((row as any).qty ?? 0);
+    out[rid] = (out[rid] ?? 0) + qty;
   }
+
   return out;
+}
+
+export async function getLatestEndedRound(raffleId: string): Promise<Round | null> {
+  const { data, error } = await supabase
+    .from("raffle_rounds")
+    .select("*")
+    .eq("raffle_id", raffleId)
+    .eq("status", "ENDED")
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  if (error) throw error;
+  return data && data.length ? mapRound(data[0]) : null;
+}
+
+export async function getWinnerUsername(roundId: number, winningTicket: number) {
+  const { data, error } = await supabase
+    .from("ticket_purchases")
+    .select("username, qty")
+    .eq("round_id", roundId)
+    .order("created_at", { ascending: true });
+
+  if (error) throw error;
+
+  let acc = 0;
+  for (const p of data ?? []) {
+    const start = acc + 1;
+    acc += Number((p as any).qty ?? 0);
+    const end = acc;
+    if (winningTicket >= start && winningTicket <= end) {
+      return String((p as any).username ?? "");
+    }
+  }
+  return "";
 }

@@ -1,17 +1,15 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import {
   buyTicket,
-  endRound,
   ensureRunningRound,
   getLatestEndedRound,
   getMyTickets,
   getRaffle,
-  getPurchases,
   getTotalTickets,
-  startNewRound,
+  getWinnerUsername,
   type Raffle,
   type Round,
 } from "@/lib/raffles_db";
@@ -25,29 +23,16 @@ function formatLeft(ms: number) {
   return `${hh}:${mm}:${ss}`;
 }
 
-function winnerFromPurchases(
-  purchases: { username: string; qty: number }[],
-  winningTicket: number
-) {
-  let acc = 0;
-  for (const p of purchases) {
-    const start = acc + 1;
-    acc += p.qty;
-    const end = acc;
-    if (winningTicket >= start && winningTicket <= end) return p.username;
-  }
-  return "";
-}
-
 export default function RaffleDetailPage() {
   const params = useParams<{ id: string }>();
   const raffleId = params.id;
 
   const [now, setNow] = useState(Date.now());
   const [user, setUser] = useState("");
-  const [raffle, setRaffle] = useState<Raffle | null>(null);
 
+  const [raffle, setRaffle] = useState<Raffle | null>(null);
   const [round, setRound] = useState<Round | null>(null);
+
   const [my, setMy] = useState(0);
   const [total, setTotal] = useState(0);
 
@@ -67,16 +52,26 @@ export default function RaffleDetailPage() {
   }, []);
 
   useEffect(() => {
-    setUser(localStorage.getItem("current_user") ?? "");
-    setActiveCode((localStorage.getItem("ref_code") ?? "").toUpperCase());
+    try {
+      setUser(localStorage.getItem("current_user") ?? "");
+      setActiveCode((localStorage.getItem("ref_code") ?? "").toUpperCase());
+    } catch {}
   }, []);
 
   async function refreshAll() {
     setErr("");
     try {
-      const u = localStorage.getItem("current_user") ?? "";
+      let u = "";
+      try {
+        u = localStorage.getItem("current_user") ?? "";
+      } catch {}
       setUser(u);
-      setActiveCode((localStorage.getItem("ref_code") ?? "").toUpperCase());
+
+      let rc = "";
+      try {
+        rc = (localStorage.getItem("ref_code") ?? "").toUpperCase();
+      } catch {}
+      setActiveCode(rc);
 
       const r = await getRaffle(raffleId);
       setRaffle(r);
@@ -96,8 +91,7 @@ export default function RaffleDetailPage() {
       setLastRound(lr);
 
       if (lr && lr.winningTicket && lr.winningTicket > 0) {
-        const purchases = await getPurchases(lr.id);
-        const wUser = winnerFromPurchases(purchases, lr.winningTicket);
+        const wUser = await getWinnerUsername(lr.id, lr.winningTicket);
         setLastWinnerUser(wUser);
         setLastWon(u ? wUser === u : null);
       } else {
@@ -116,53 +110,28 @@ export default function RaffleDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [raffleId]);
 
-  // Auto-Ende + neue Runde
-  useEffect(() => {
-    const run = async () => {
-      if (!raffle || !round) return;
-      if (busy) return;
-
-      const endAt = new Date(round.endsAt).getTime();
-      if (now < endAt) return;
-      if (round.status !== "RUNNING") return;
-
-      setBusy(true);
-      setErr("");
-
-      try {
-        const totalAtDraw = await getTotalTickets(round.id);
-        let winningTicket: number | null = null;
-
-        if (totalAtDraw > 0) {
-          winningTicket = Math.floor(Math.random() * totalAtDraw) + 1;
-        }
-
-        await endRound(round.id, winningTicket, totalAtDraw > 0 ? totalAtDraw : null);
-        await startNewRound(raffle);
-
-        await refreshAll();
-      } catch (e: any) {
-        setErr(e?.message ?? "Fehler beim Draw");
-      } finally {
-        setBusy(false);
-      }
-    };
-
-    run();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [now, raffle, round]);
-
   async function onBuy() {
     if (!raffle || !round) return;
-    const u = localStorage.getItem("current_user") ?? "";
-    if (!u) return (location.href = "/login");
+
+    let u = "";
+    try {
+      u = localStorage.getItem("current_user") ?? "";
+    } catch {}
+
+    if (!u) {
+      location.href = "/login";
+      return;
+    }
 
     if (busy) return;
     setBusy(true);
     setErr("");
 
     try {
-      const code = (localStorage.getItem("ref_code") ?? "").trim().toUpperCase() || null;
+      let code: string | null = null;
+      try {
+        code = (localStorage.getItem("ref_code") ?? "").trim().toUpperCase() || null;
+      } catch {}
 
       await buyTicket({
         raffleId: raffle.id,
@@ -183,13 +152,17 @@ export default function RaffleDetailPage() {
   function applyCode() {
     const c = codeInput.trim().toUpperCase();
     if (!c) return;
-    localStorage.setItem("ref_code", c);
+    try {
+      localStorage.setItem("ref_code", c);
+    } catch {}
     setActiveCode(c);
     setCodeInput("");
   }
 
   function clearCode() {
-    localStorage.removeItem("ref_code");
+    try {
+      localStorage.removeItem("ref_code");
+    } catch {}
     setActiveCode("");
     setCodeInput("");
   }
@@ -250,6 +223,10 @@ export default function RaffleDetailPage() {
               <div className="text-zinc-300">
                 Ticket: <span className="text-white font-semibold">{raffle.ticketPrice}</span>
               </div>
+            </div>
+
+            <div className="mt-2 text-xs text-zinc-400">
+              {ended ? "Ziehung läuft… (Cron) – gleich startet die nächste Runde." : ""}
             </div>
 
             {/* Creator Code */}
@@ -326,7 +303,8 @@ export default function RaffleDetailPage() {
                     <span className="text-white font-semibold">{lastRound.totalAtDraw ?? "-"}</span>
                   </div>
                   <div className="mt-1 text-sm text-zinc-400">
-                    Gewinner User: <span className="text-zinc-200 font-semibold">{lastWinnerUser || "-"}</span>
+                    Gewinner User:{" "}
+                    <span className="text-zinc-200 font-semibold">{lastWinnerUser || "-"}</span>
                   </div>
                 </div>
               )}
