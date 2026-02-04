@@ -5,14 +5,14 @@ import { supabaseAdmin } from "@/lib/supabaseAdmin";
 export const runtime = "nodejs";
 
 function isAuthorized(req: Request) {
-  // Vercel Cron sendet diesen Header
-  const vercelCron = req.headers.get("x-vercel-cron") === "1";
-  if (vercelCron) return true;
+  // Vercel Cron Header
+  if (req.headers.get("x-vercel-cron") === "1") return true;
 
-  // Manuell testen via ?secret=
+  // Manuell testen: /api/tick?secret=...
   const url = new URL(req.url);
-  const secret = url.searchParams.get("secret") || "";
-  return !!process.env.CRON_SECRET && secret === process.env.CRON_SECRET;
+  const qp = url.searchParams.get("secret") ?? "";
+  const secret = process.env.CRON_SECRET ?? "";
+  return !!secret && qp === secret;
 }
 
 export async function GET(req: Request) {
@@ -20,77 +20,52 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const now = new Date().toISOString();
+  const nowIso = new Date().toISOString();
 
-  const { data: raffles, error: eR } = await supabaseAdmin
-    .from("raffles")
-    .select("id, duration_seconds");
+  // Nur abgelaufene RUNNING-Runden holen
+  const { data: expiredRounds, error: e1 } = await supabaseAdmin
+    .from("raffle_rounds")
+    .select("id, raffle_id, ends_at")
+    .eq("status", "RUNNING")
+    .lte("ends_at", nowIso);
 
-  if (eR) return NextResponse.json({ error: eR.message }, { status: 500 });
+  if (e1) return NextResponse.json({ error: e1.message }, { status: 500 });
 
   const done: any[] = [];
-  let processed = 0;
 
-  for (const r of raffles ?? []) {
-    const raffleId = String((r as any).id);
-    const duration = Number((r as any).duration_seconds ?? 0);
+  for (const rr of expiredRounds ?? []) {
+    const roundId = Number((rr as any).id);
+    const raffleId = String((rr as any).raffle_id);
 
-    const { data: round } = await supabaseAdmin
-      .from("raffle_rounds")
-      .select("id, raffle_id, start_at, ends_at, total_tickets, winning_ticket")
-      .eq("raffle_id", raffleId)
-      .order("id", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    // Total Tickets aus Käufen berechnen
+    const { data: purchases, error: e2 } = await supabaseAdmin
+      .from("ticket_purchases")
+      .select("qty")
+      .eq("round_id", roundId);
 
-    // wenn kein Round existiert → anlegen
-    if (!round) {
-      const start = new Date();
-      const ends = new Date(start.getTime() + duration * 1000);
-      await supabaseAdmin.from("raffle_rounds").insert({
-        raffle_id: raffleId,
-        start_at: start.toISOString(),
-        ends_at: ends.toISOString(),
-        total_tickets: 0,
-        winning_ticket: null,
-      });
-      processed++;
-      continue;
-    }
+    if (e2) continue;
 
-    const endsAt = new Date((round as any).ends_at).getTime();
-    const isOver = Date.now() >= endsAt;
+    const total = (purchases ?? []).reduce(
+      (a: number, x: any) => a + Number((x as any).qty ?? 0),
+      0
+    );
 
-    if (!isOver) continue;
-
-    const total = Number((round as any).total_tickets ?? 0);
     const winningTicket = total > 0 ? randomInt(1, total + 1) : null;
 
-    await supabaseAdmin
+    // Runde beenden (WICHTIG: KEIN neuer Round wird hier erstellt)
+    const { error: e3 } = await supabaseAdmin
       .from("raffle_rounds")
-      .update({ winning_ticket: winningTicket })
-      .eq("id", (round as any).id);
+      .update({
+        status: "ENDED",
+        winning_ticket: winningTicket,
+        total_at_draw: total > 0 ? total : null,
+      })
+      .eq("id", roundId);
 
-    done.push({
-      raffleId,
-      roundId: (round as any).id,
-      total,
-      winningTicket,
-    });
+    if (e3) continue;
 
-    // neuen Round starten
-    const start = new Date();
-    const ends = new Date(start.getTime() + duration * 1000);
-    await supabaseAdmin.from("raffle_rounds").insert({
-      raffle_id: raffleId,
-      start_at: start.toISOString(),
-      ends_at: ends.toISOString(),
-      total_tickets: 0,
-      winning_ticket: null,
-    });
-
-    processed++;
+    done.push({ raffleId, roundId, total, winningTicket });
   }
 
-  return NextResponse.json({ ok: true, processed, done, now });
+  return NextResponse.json({ ok: true, processed: done.length, done });
 }
